@@ -1,70 +1,110 @@
-from langchain.document_loaders import YoutubeLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import LLMChain
-from dotenv import find_dotenv, load_dotenv
-from langchain.prompts.chat import (
-    ChatPromptTemplate,
-    SystemMessagePromptTemplate,
-    HumanMessagePromptTemplate,
-)
-import textwrap
+import pytube
+import torch
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer
+from moviepy.editor import VideoFileClip
+import speech_recognition as sr
 
-load_dotenv(find_dotenv())
-embeddings = OpenAIEmbeddings()
+# Download video and extract audio
+def download_video(video_url):
+    try:
+        yt = pytube.YouTube(video_url)
+        video = yt.streams.filter(only_audio=True).first()
+        if not video:
+            print("No audio stream found for the specified video URL.")
+            return None
 
+        video.download()
 
-def create_db_from_youtube_video_url(video_url):
-    loader = YoutubeLoader.from_youtube_url(video_url)
-    transcript = loader.load()
+        # Get the audio file path after downloading the video
+        audio_file = video.default_filename.replace(".mp4", ".mp3")
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=100)
-    docs = text_splitter.split_documents(transcript)
+        # Convert the video file to audio using moviepy
+        video_path = video.default_filename
+        audio_path = audio_file
+        video_clip = VideoFileClip(video_path)
+        audio_clip = video_clip.audio
+        audio_clip.write_audiofile(audio_path)
 
-    db = FAISS.from_documents(docs, embeddings)
-    return db
+        # Close the video file clip
+        video_clip.close()
 
+        return audio_file
 
-def get_response_from_query(db, query, k=4):
-    docs = db.similarity_search(query, k=k)
-    docs_page_content = " ".join([d.page_content for d in docs])
+    except pytube.exceptions.VideoUnavailable:
+        print("Video is unavailable or access is restricted.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
-    chat = ChatOpenAI(model_name="gpt-3.5-turbo-16k", temperature=0.2)
-
-    # Template to use for the system message prompt
-    template = """
-        You are a helpful assistant that that can answer questions about youtube videos 
-        based on the video's transcript: {docs}
-        
-        Only use the factual information from the transcript to answer the question.
-        
-        If you feel like you don't have enough information to answer the question, say "I don't know".
-        
-        """
-
-    system_message_prompt = SystemMessagePromptTemplate.from_template(template)
-
-    # Human question prompt
-    human_template = "Answer the following question: {question}"
-    human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
-
-    chat_prompt = ChatPromptTemplate.from_messages(
-        [system_message_prompt, human_message_prompt]
-    )
-
-    chain = LLMChain(llm=chat, prompt=chat_prompt)
-
-    response = chain.run(question=query, docs=docs_page_content)
-    response = response.replace("\n", "")
-    return response, docs
+    return None
 
 
-# Example usage:
-video_url = "https://www.youtube.com/watch?v=th4j9JxWGko"
-db = create_db_from_youtube_video_url(video_url)
+# Transcribe audio to text
+def transcribe_audio(audio_file):
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_file) as source:
+        audio_data = recognizer.record(source)
+        try:
+            transcript = recognizer.recognize_google(audio_data)
+            return transcript
+        except sr.UnknownValueError:
+            print("Speech Recognition could not understand the audio")
+        except sr.RequestError as e:
+            print(f"Could not request results from Google Speech Recognition service; {e}")
 
-query = "what is this video about?"
-response, docs = get_response_from_query(db, query)
-print(textwrap.fill(response, width=50))
+    return None
+
+# Load question answering model
+def load_qa_model():
+    model_name = "bert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForQuestionAnswering.from_pretrained(model_name)
+    return tokenizer, model
+
+# Answer questions based on transcript
+def answer_questions(transcript, question):
+    tokenizer, model = load_qa_model()
+    prompt_text = f"Question: {question}"
+    encoded_text = tokenizer(transcript, prompt_text, return_tensors="pt")
+
+    # Convert input_ids and attention_mask to tensors on the GPU (if available)
+    if torch.cuda.is_available():
+        encoded_text['input_ids'] = encoded_text['input_ids'].cuda()
+        encoded_text['attention_mask'] = encoded_text['attention_mask'].cuda()
+
+    outputs = model(**encoded_text)
+    start_logits = outputs.start_logits
+    end_logits = outputs.end_logits
+
+    # Move tensors back to CPU (if necessary)
+    if torch.cuda.is_available():
+        start_logits = start_logits.cpu()
+        end_logits = end_logits.cpu()
+
+    answer_start = torch.argmax(start_logits, dim=-1)
+    answer_end = torch.argmax(end_logits, dim=-1)
+
+    answer = transcript[answer_start:answer_end+1]
+    return answer
+
+# Chatbot interface
+def chatbot():
+    while True:
+        video_url = input("Enter YouTube video URL: ")
+        audio_file = download_video(video_url)
+
+        if audio_file is not None:
+            # Proceed with transcription and question-answering if audio is available
+            transcript = transcribe_audio(audio_file)
+
+            if transcript is not None:
+                question = input("Ask a question about the video: ")
+                answer = answer_questions(transcript, question)
+                print(answer)
+            else:
+                print("Transcription failed. Please try a different video.")
+        else:
+            # Handle the case where no audio stream was found
+            print("No audio stream found for the specified video URL. Please try a different video.")
+
+if __name__ == "__main__":
+    chatbot()
