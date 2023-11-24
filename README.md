@@ -1,4 +1,4 @@
-# YouTube Chatbot with Question Answering
+# YODA
 
 This repository hosts a Python-based chatbot that interacts with YouTube videos. The chatbot downloads a specified YouTube video, transcribes its audio content to text using speech recognition, and then uses a pre-trained question-answering model to answer user queries about the video.
 
